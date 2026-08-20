@@ -1,0 +1,13 @@
+# AULA keyboards — allow the seated user to reach the vendor HID channel.
+#
+# Install:
+#   sudo cp udev/99-aula.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+# then replug the keyboard.
+#
+# Regenerate for a wider set of models with:  aula udev
+
+# Wired: every keyboard in this family enumerates as 258a:010c.
+KERNEL=="hidraw*", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess", MODE="0660"
+# 2.4 GHz dongle used by the tri-mode models.
+KERNEL=="hidraw*", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess", MODE="0660"

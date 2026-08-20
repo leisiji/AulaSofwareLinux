@@ -4,7 +4,7 @@
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-rule="$here/udev/99-aula.rules"
+rule="$here/udev/60-aula.rules"
 
 if [ ! -f "$rule" ]; then
     echo "aula: $rule is missing; is the archive complete?" >&2
@@ -15,7 +15,10 @@ echo "aula is installed in $here"
 echo
 echo "Installing the udev rule needs root, because /dev/hidraw* is root-only"
 echo "until a rule grants the logged-in user access."
-sudo cp "$rule" /etc/udev/rules.d/99-aula.rules
+# An earlier version installed this at 99-, which is too late for systemd to
+# grant the uaccess ACL. Clear it out so the two do not both sit there.
+sudo rm -f /etc/udev/rules.d/99-aula.rules
+sudo cp "$rule" /etc/udev/rules.d/60-aula.rules
 sudo udevadm control --reload
 sudo udevadm trigger
 

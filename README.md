@@ -41,7 +41,7 @@ userspace program can reach the keyboard. Replug the keyboard afterwards, then:
 git clone https://github.com/yhuikzdtguioaert/AulaSofwareLinux
 cd AulaSofwareLinux
 cargo build --release
-sudo cp udev/99-aula.rules /etc/udev/rules.d/
+sudo cp udev/60-aula.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 ./target/release/aula
 ```

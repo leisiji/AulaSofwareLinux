@@ -236,7 +236,7 @@ pub fn permission_hint(path: &Path, err: &io::Error) -> String {
         format!(
             "{}: permission denied.\n\
              Install the udev rule and replug the keyboard:\n\
-             \x20 sudo cp udev/99-aula.rules /etc/udev/rules.d/ && sudo udevadm control --reload",
+             \x20 sudo cp udev/60-aula.rules /etc/udev/rules.d/ && sudo udevadm control --reload",
             path.display()
         )
     } else {

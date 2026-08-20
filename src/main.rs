@@ -248,10 +248,13 @@ fn udev_rule(profiles: &[profile::DeviceProfile]) -> String {
     ids.sort_unstable();
     ids.dedup();
 
+    // The 60- prefix is load-bearing: systemd grants the uaccess ACL from
+    // 73-seat-late.rules, and udev runs rule files in ascending order, so a
+    // file numbered above 73 tags the device too late to get one.
     let mut out = String::from(
         "# AULA keyboards — allow the seated user to reach the vendor HID channel.\n\
-         # Install: sudo cp 99-aula.rules /etc/udev/rules.d/\n\
-         #          sudo udevadm control --reload && sudo udevadm trigger\n",
+         # Install as /etc/udev/rules.d/60-aula.rules — the number must stay below 73.\n\
+         #   sudo udevadm control --reload && sudo udevadm trigger\n",
     );
     for (vid, pid) in ids {
         out.push_str(&format!(

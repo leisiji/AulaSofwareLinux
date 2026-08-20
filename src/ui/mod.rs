@@ -779,7 +779,7 @@ impl App {
             ui.add_space(8.0);
             ui.label(
                 "If the keyboard is plugged in but not listed, /dev/hidraw* is probably \
-                 root-only. Install udev/99-aula.rules and replug it.",
+                 root-only. Install udev/60-aula.rules and replug it.",
             );
             return;
         };

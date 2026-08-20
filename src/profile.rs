@@ -151,8 +151,16 @@ impl DeviceProfile {
                 .unwrap_or_else(|| id.to_string()),
             vid: ini.num("OPT", "VID").unwrap_or(0) as u16,
             pid: ini.num("OPT", "PID").unwrap_or(0) as u16,
-            wireless_vid: ini.num("OPT", "VID_Wireless").map(|v| v as u16),
-            wireless_pid: ini.num("OPT", "PID_Wireless").map(|v| v as u16),
+            // Wired-only models write `VID_Wireless=0` rather than leaving the
+            // key out, so zero means "no dongle", not USB id 0000.
+            wireless_vid: ini
+                .num("OPT", "VID_Wireless")
+                .map(|v| v as u16)
+                .filter(|v| *v != 0),
+            wireless_pid: ini
+                .num("OPT", "PID_Wireless")
+                .map(|v| v as u16)
+                .filter(|v| *v != 0),
             password,
             fw: ini.num("OPT", "Fw").unwrap_or(0),
             crc: ini.num("OPT", "CRC").unwrap_or(0) != 0,
@@ -471,6 +479,24 @@ K1=0x09,0x01,0x07000004
         assert_eq!(p.speed_hw(4), 0);
         assert_eq!(p.speed_hw(99), 0, "out of range clamps to the last entry");
         assert_eq!(p.sleep_hw(90), 3);
+    }
+
+    #[test]
+    fn a_zero_wireless_id_means_there_is_no_dongle() {
+        // The wired-only profiles ship `VID_Wireless=0`; taking that literally
+        // would put a rule for USB 0000:0000 in the generated udev file.
+        let text = "[OPT]\nVID=0x258a\nPID=0x010C\nPsd=3,0,0,0,0,cd\n\
+                    VID_Wireless=0\nPID_Wireless=0\n";
+        let p = DeviceProfile::from_text("wired", Path::new("."), text).unwrap();
+        assert_eq!(p.wireless_vid, None);
+        assert_eq!(p.wireless_pid, None);
+
+        let text = text
+            .replace("VID_Wireless=0", "VID_Wireless=0x3554")
+            .replace("PID_Wireless=0", "PID_Wireless=0xfa09");
+        let p = DeviceProfile::from_text("wireless", Path::new("."), &text).unwrap();
+        assert_eq!(p.wireless_vid, Some(0x3554));
+        assert_eq!(p.wireless_pid, Some(0xfa09));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use egui::{Color32, Rect, Sense, Vec2};
 
 use crate::assets::{Skins, Strings};
 use crate::config_page::{ConfigPage, Layout, COLORS, COLOR_RANDOM, PAGE_LEN};
+use crate::he;
 use crate::profile::DeviceProfile;
 use crate::worker::{Event, Request, Worker};
 use keyboard::KeyboardView;
@@ -61,6 +62,7 @@ pub struct App {
 
     tab: Tab,
     connected: Option<Connected>,
+    he: Option<HeState>,
     keyboard: Option<KeyboardView>,
     page: ConfigPage,
     rgb: Vec<u8>,
@@ -85,6 +87,17 @@ struct Connected {
     node: String,
 }
 
+/// A connected Hall-effect keyboard and the lighting page last read from it.
+struct HeState {
+    info: he::Info,
+    lighting: he::Lighting,
+    node: String,
+    /// Active onboard configuration (profile), `0..=3`.
+    config_id: u8,
+    /// Colour the "fill all keys" button writes.
+    key_fill: [u8; 3],
+}
+
 impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -107,6 +120,7 @@ impl App {
             assets_root,
             tab: Tab::Light,
             connected: None,
+            he: None,
             keyboard: None,
             page: ConfigPage::blank(Layout::default()),
             rgb: Vec::new(),
@@ -146,11 +160,40 @@ impl App {
                             report_id,
                             node,
                         });
+                        self.he = None;
                         self.error = None;
+                    }
+                }
+                Event::HeConnected {
+                    info,
+                    node,
+                    config_id,
+                } => {
+                    self.status = format!("{} · {node}", info.name);
+                    self.connected = None;
+                    self.keyboard = None;
+                    self.he = Some(HeState {
+                        info,
+                        lighting: he::Lighting::default(),
+                        node,
+                        config_id,
+                        key_fill: [0x00, 0xa0, 0xff],
+                    });
+                    self.error = None;
+                }
+                Event::HeLighting(lighting) => {
+                    if let Some(he) = self.he.as_mut() {
+                        he.lighting = lighting;
+                    }
+                }
+                Event::HeConfigId(id) => {
+                    if let Some(he) = self.he.as_mut() {
+                        he.config_id = id;
                     }
                 }
                 Event::Disconnected(msg) => {
                     self.connected = None;
+                    self.he = None;
                     self.keyboard = None;
                     self.status = msg;
                 }
@@ -266,10 +309,14 @@ impl eframe::App for App {
             .show(&ctx, |ui| {
                 ui.set_min_size(content.size());
                 ui.set_max_size(content.size());
-                match self.tab {
-                    Tab::Light => self.tab_light(ui, content),
-                    Tab::Settings => self.tab_settings(ui),
-                    Tab::Diagnostics => self.tab_diagnostics(ui),
+                if self.he.is_some() {
+                    self.he_page(ui, content);
+                } else {
+                    match self.tab {
+                        Tab::Light => self.tab_light(ui, content),
+                        Tab::Settings => self.tab_settings(ui),
+                        Tab::Diagnostics => self.tab_diagnostics(ui),
+                    }
                 }
             });
 
@@ -392,8 +439,26 @@ impl App {
         let font = egui::FontId::proportional(15.0);
         let small = egui::FontId::proportional(12.0);
 
-        let (title, lines) = match &self.connected {
-            Some(c) => {
+        let (title, lines) = match (&self.he, &self.connected) {
+            (Some(he), _) => {
+                let lines = vec![
+                    format!(
+                        "{}: {}",
+                        self.strings.get("tc_msg3", "Firmware"),
+                        he.info.firmware
+                    ),
+                    format!("Protocol: {}", he.info.protocol),
+                    format!("Serial: {}", he.info.serial),
+                    format!("Board id: 0x{:08x}", he.info.board_id),
+                    format!(
+                        "Travel: {:.3}-{:.3} mm",
+                        he.info.min_travel_mm, he.info.max_travel_mm
+                    ),
+                    format!("Node: {}", he.node),
+                ];
+                (he.info.name.clone(), lines)
+            }
+            (None, Some(c)) => {
                 let mut lines = vec![
                     format!(
                         "{}: {}",
@@ -418,7 +483,7 @@ impl App {
                 }
                 (c.display_name.clone(), lines)
             }
-            None => (
+            (None, None) => (
                 self.strings
                     .get("tc_msg35", "Please connect your device.")
                     .to_string(),
@@ -746,6 +811,116 @@ impl App {
         );
     }
 
+    /// The Hall-effect keyboard's own page: identity and lighting. There is no
+    /// vendor skin for this generation, so the controls are plain egui.
+    fn he_page(&mut self, ui: &mut egui::Ui, content: Rect) {
+        let Some(state) = self.he.as_ref() else {
+            return;
+        };
+        self.page_title(ui, content, self.strings.get("tc_kb1", "Light effect"));
+
+        let mut lighting = state.lighting.clone();
+        let current_config = state.config_id;
+        let mut key_fill = state.key_fill;
+        let mut changed = false;
+        let mut switch_to: Option<u8> = None;
+        let mut fill_keys = false;
+
+        let area = Rect::from_min_max(egui::pos2(content.min.x, content.min.y + 34.0), content.max);
+        widgets::at(ui, area, egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Profile");
+                for id in 0..4u8 {
+                    if ui
+                        .selectable_label(current_config == id, format!("Config {}", id + 1))
+                        .clicked()
+                        && current_config != id
+                    {
+                        switch_to = Some(id);
+                    }
+                }
+            });
+            ui.add_space(12.0);
+            changed |= ui.checkbox(&mut lighting.on, "Lighting on").changed();
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Mode");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut lighting.mode).range(0..=30))
+                    .changed();
+                ui.add_space(16.0);
+                ui.label("Brightness");
+                changed |= ui
+                    .add(egui::Slider::new(&mut lighting.brightness, 0..=4))
+                    .changed();
+                ui.add_space(16.0);
+                ui.label("Speed");
+                changed |= ui
+                    .add(egui::Slider::new(&mut lighting.speed, 0..=4))
+                    .changed();
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Sleep");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut lighting.sleep).range(0..=255))
+                    .changed();
+                ui.add_space(16.0);
+                ui.label("Static mode");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut lighting.static_mode).range(0..=255))
+                    .changed();
+                ui.add_space(16.0);
+                changed |= ui.checkbox(&mut lighting.direction, "Direction").changed();
+                changed |= ui
+                    .checkbox(&mut lighting.super_response, "Super response")
+                    .changed();
+            });
+
+            ui.add_space(14.0);
+            ui.label("Palette");
+            ui.horizontal_wrapped(|ui| {
+                for c in lighting.colors.iter_mut() {
+                    changed |= ui.color_edit_button_srgb(c).changed();
+                }
+            });
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label("Key colours");
+                ui.color_edit_button_srgb(&mut key_fill);
+                if ui.button("Fill all keys").clicked() {
+                    fill_keys = true;
+                }
+            });
+
+            ui.add_space(16.0);
+            ui.label(
+                "Changes are written one at a time and read back from the keyboard. \
+                 Per-key RGB, actuation and rapid trigger are not implemented yet.",
+            );
+        });
+
+        if changed {
+            if let Some(state) = self.he.as_mut() {
+                state.lighting = lighting.clone();
+            }
+            self.worker.send(Request::HeLighting(lighting));
+        }
+        if let Some(id) = switch_to {
+            if let Some(state) = self.he.as_mut() {
+                state.config_id = id;
+            }
+            self.worker.send(Request::HeConfigId(id));
+        }
+        if let Some(state) = self.he.as_mut() {
+            state.key_fill = key_fill;
+        }
+        if fill_keys {
+            self.worker.send(Request::HeFillKeys(key_fill));
+        }
+    }
+
     /// Heading drawn in the same place on every page.
     fn page_title(&self, ui: &egui::Ui, content: Rect, text: &str) {
         ui.painter().text(
@@ -756,7 +931,6 @@ impl App {
             self.theme.button_text_hover,
         );
     }
-
     fn empty_page(&self, ui: &egui::Ui, content: Rect) {
         ui.painter().text(
             egui::pos2(content.min.x, content.min.y + 40.0),

@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const HIDRAW_CLASS: &str = "/sys/class/hidraw";
 
@@ -49,6 +50,25 @@ pub struct HidNode {
     pub name: String,
     /// `(report id, feature payload size in bytes)`, excluding the id byte.
     pub feature_reports: Vec<(u8, usize)>,
+    /// Every usage collection the descriptor declares, with the report shapes
+    /// inside it. The BYCOMBO4 family is found through `feature_reports`; the
+    /// Hall-effect family is found through `collections`.
+    pub collections: Vec<UsageCollection>,
+}
+
+/// A usage collection from a report descriptor, with the reports it declares.
+///
+/// The vendor channel of the Hall-effect generation is a plain application
+/// collection (`Usage Page 0xFFA0`, `Usage 0x01`) carrying a 64-byte input and
+/// a 64-byte output report, so it can be recognised by shape alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageCollection {
+    pub usage_page: u16,
+    pub usage: u16,
+    /// `(report id, payload size in bytes)` for each report kind.
+    pub inputs: Vec<(u8, usize)>,
+    pub outputs: Vec<(u8, usize)>,
+    pub features: Vec<(u8, usize)>,
 }
 
 impl HidNode {
@@ -108,6 +128,7 @@ fn read_node(sys: &Path) -> Option<HidNode> {
         pid,
         name: hid_name,
         feature_reports: feature_reports(&desc),
+        collections: usage_collections(&desc),
     })
 }
 
@@ -174,6 +195,126 @@ pub fn feature_reports(desc: &[u8]) -> Vec<(u8, usize)> {
     out
 }
 
+/// Walk a report descriptor and return every usage collection together with
+/// the input, output and feature reports declared inside it.
+///
+/// Collections nest; fields are attributed to the enclosing application
+/// collection, which is what WebHID matches a `filters` entry against.
+pub fn usage_collections(desc: &[u8]) -> Vec<UsageCollection> {
+    #[derive(Default)]
+    struct Bits {
+        inputs: Vec<(u8, u64)>,
+        outputs: Vec<(u8, u64)>,
+        features: Vec<(u8, u64)>,
+    }
+    fn add(list: &mut Vec<(u8, u64)>, id: u8, bits: u64) {
+        match list.iter_mut().find(|(i, _)| *i == id) {
+            Some((_, total)) => *total += bits,
+            None => list.push((id, bits)),
+        }
+    }
+    fn finish(page: u16, usage: u16, bits: Bits) -> UsageCollection {
+        let conv = |v: Vec<(u8, u64)>| {
+            let mut v: Vec<(u8, usize)> = v
+                .into_iter()
+                .map(|(id, bits)| (id, bits.div_ceil(8) as usize))
+                .collect();
+            v.sort_by_key(|(id, _)| *id);
+            v
+        };
+        UsageCollection {
+            usage_page: page,
+            usage,
+            inputs: conv(bits.inputs),
+            outputs: conv(bits.outputs),
+            features: conv(bits.features),
+        }
+    }
+
+    let mut out = Vec::new();
+    // The open application collection, still collecting its report sizes.
+    let mut current: Option<(u16, u16, Bits)> = None;
+    // One flag per open collection: is it an application collection?
+    let mut is_app: Vec<bool> = Vec::new();
+
+    let mut usage_page: u16 = 0;
+    let mut report_id: u8 = 0;
+    let mut report_size: u32 = 0;
+    let mut report_count: u32 = 0;
+    let mut local_usage: u16 = 0;
+
+    let mut i = 0usize;
+    while i < desc.len() {
+        let head = desc[i];
+        i += 1;
+        if head == 0xfe {
+            let len = *desc.get(i).unwrap_or(&0) as usize;
+            i += 2 + len;
+            continue;
+        }
+        let size = match head & 0x03 {
+            0 => 0usize,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        if i + size > desc.len() {
+            break;
+        }
+        let mut data: u32 = 0;
+        for (n, b) in desc[i..i + size].iter().enumerate() {
+            data |= (*b as u32) << (8 * n);
+        }
+        i += size;
+
+        let ty = (head >> 2) & 0x03;
+        let tag = head >> 4;
+        match (ty, tag) {
+            (1, 0x0) => usage_page = data as u16,
+            (1, 0x8) => report_id = data as u8,
+            (1, 0x7) => report_size = data,
+            (1, 0x9) => report_count = data,
+            (2, 0x0) => local_usage = data as u16,
+            // Main item: Collection. `data` is the collection type (1 = app).
+            (0, 0xa) => {
+                let app = data == 0x01;
+                is_app.push(app);
+                if app {
+                    if let Some((p, u, bits)) = current.take() {
+                        out.push(finish(p, u, bits));
+                    }
+                    current = Some((usage_page, local_usage, Bits::default()));
+                }
+                local_usage = 0;
+            }
+            // Main item: End Collection.
+            (0, 0xc) => {
+                if is_app.pop().unwrap_or(false) {
+                    if let Some((p, u, bits)) = current.take() {
+                        out.push(finish(p, u, bits));
+                    }
+                }
+            }
+            // Main items: Input, Output, Feature.
+            (0, 0x8) | (0, 0x9) | (0, 0xb) => {
+                let bits = (report_size as u64) * (report_count as u64);
+                if let Some((_, _, buf)) = current.as_mut() {
+                    match tag {
+                        0x8 => add(&mut buf.inputs, report_id, bits),
+                        0x9 => add(&mut buf.outputs, report_id, bits),
+                        _ => add(&mut buf.features, report_id, bits),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((p, u, bits)) = current.take() {
+        out.push(finish(p, u, bits));
+    }
+    out
+}
+
 /// An opened hidraw node.
 pub struct HidDevice {
     file: File,
@@ -227,6 +368,40 @@ impl HidDevice {
         } else {
             Ok(ret as usize)
         }
+    }
+
+    /// Send one output report by writing to the node.
+    ///
+    /// For a device without numbered reports the buffer *is* the report; for a
+    /// numbered one `buf[0]` must be the report id. The Hall-effect family has
+    /// no report id, so a 64-byte frame is written as-is.
+    pub fn write_output(&self, buf: &[u8]) -> io::Result<usize> {
+        use std::io::Write;
+        (&self.file).write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    /// Wait up to `timeout` for one input report and read it into `buf`.
+    ///
+    /// Returns `None` when the device stayed quiet, which is normal for a
+    /// request that has no answer.
+    pub fn read_report(&self, buf: &mut [u8], timeout: Duration) -> io::Result<Option<usize>> {
+        use std::io::Read;
+        let mut pfd = libc::pollfd {
+            fd: self.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let ret = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            return Ok(None);
+        }
+        let n = (&self.file).read(buf)?;
+        Ok(Some(n))
     }
 }
 
@@ -284,5 +459,39 @@ mod tests {
         // HIDIOCSFEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, len)
         assert_eq!(hidioc_set_feature(520), 0xC2084806);
         assert_eq!(hidioc_get_feature(520), 0xC2084807);
+    }
+
+    /// Real descriptor of the vendor interface of an AULA WIN 60 HE PRO
+    /// (1ca2:1902, hidraw4): Usage Page 0xFFA0, Usage 0x01, one 64-byte input
+    /// and one 64-byte output report, no report id.
+    const WIN60HE_IFACE2: &[u8] = &[
+        0x06, 0xa0, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x09, 0x02, 0xa1, 0x00, 0x06, 0xa1, 0xff, 0x09,
+        0x03, 0x09, 0x04, 0x15, 0x00, 0x26, 0xff, 0x00, 0x35, 0x00, 0x46, 0xff, 0x00, 0x75, 0x08,
+        0x95, 0x40, 0x81, 0x02, 0x09, 0x05, 0x09, 0x06, 0x15, 0x00, 0x26, 0xff, 0x00, 0x35, 0x00,
+        0x46, 0xff, 0x00, 0x75, 0x08, 0x95, 0x40, 0x91, 0x02, 0xc0, 0xc0,
+    ];
+
+    #[test]
+    fn finds_the_hall_effect_vendor_collection() {
+        let c = usage_collections(WIN60HE_IFACE2);
+        let vendor = c
+            .iter()
+            .find(|c| c.usage_page == 0xFFA0 && c.usage == 0x01)
+            .expect("the vendor collection should be found");
+        assert_eq!(vendor.inputs, vec![(0, 64)]);
+        assert_eq!(vendor.outputs, vec![(0, 64)]);
+        assert!(vendor.features.is_empty());
+    }
+
+    #[test]
+    fn attributes_reports_to_their_application_collection() {
+        let c = usage_collections(F75_IFACE1);
+        // The family declares several 0xFF00/0x01 collections; the 519-byte
+        // feature report lives in one of them.
+        assert!(
+            c.iter().any(|c| c.features.contains(&(6, 519))),
+            "expected a collection with feature report 6:519, got {c:?}"
+        );
+        assert!(c.iter().any(|c| c.features.contains(&(5, 5))));
     }
 }

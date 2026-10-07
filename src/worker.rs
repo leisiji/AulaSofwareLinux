@@ -10,6 +10,7 @@ use std::thread;
 
 use crate::config_page::PAGE_LEN;
 use crate::device::{self, Keyboard};
+use crate::he;
 use crate::profile::DeviceProfile;
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,12 @@ pub enum Request {
         value: u8,
     },
     FactoryReset,
+    /// Replace the Hall-effect keyboard's lighting page.
+    HeLighting(he::Lighting),
+    /// Select an onboard Hall-effect configuration (profile), `0..=3`.
+    HeConfigId(u8),
+    /// Fill every key's custom colour, for the per-key lighting mode.
+    HeFillKeys([u8; 3]),
     /// Raw read, exposed by `aula probe` for protocol work.
     RawRead {
         command: u8,
@@ -45,6 +52,16 @@ pub enum Event {
         node: String,
     },
     Disconnected(String),
+    /// A Hall-effect keyboard was identified.
+    HeConnected {
+        info: he::Info,
+        node: String,
+        config_id: u8,
+    },
+    /// The Hall-effect lighting page, as read back from the keyboard.
+    HeLighting(he::Lighting),
+    /// The onboard configuration (profile) the keyboard confirmed.
+    HeConfigId(u8),
     Config(Vec<u8>),
     RgbTable(Vec<u8>),
     Power(Vec<u8>),
@@ -97,17 +114,73 @@ impl Worker {
 
 fn run(profiles: Vec<DeviceProfile>, rx: Receiver<Request>, tx: Sender<Event>) {
     let mut kb: Option<Keyboard> = None;
+    let mut hall: Option<(he::Link, he::Info)> = None;
     while let Ok(req) = rx.recv() {
         match req {
-            Request::Connect => match connect(&profiles, &tx) {
-                Some(k) => {
-                    kb = Some(k);
-                    refresh(kb.as_ref().unwrap(), &tx);
+            Request::Connect => {
+                // Try the mechanical family first; the Hall-effect backend is
+                // the fallback, since the two never appear together.
+                kb = connect_mechanical(&profiles, &tx);
+                hall = None;
+                match &kb {
+                    Some(k) => refresh(k, &tx),
+                    None => {
+                        hall = connect_he(&tx);
+                        match &hall {
+                            Some((link, _)) => refresh_he(link, &tx),
+                            None => send_disconnected(&tx),
+                        }
+                    }
                 }
-                None => kb = None,
+            }
+            Request::Refresh => match (&kb, &hall) {
+                (Some(k), _) => refresh(k, &tx),
+                (None, Some((link, _))) => refresh_he(link, &tx),
+                _ => send_disconnected(&tx),
             },
-            Request::Refresh => match &kb {
-                Some(k) => refresh(k, &tx),
+            Request::HeLighting(lighting) => match &mut hall {
+                Some((link, _)) => match link.set_lighting(&lighting) {
+                    Ok(after) => {
+                        let _ = tx.send(Event::HeLighting(after));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Event::Error(format!("{e}")));
+                    }
+                },
+                None => send_disconnected(&tx),
+            },
+            Request::HeConfigId(id) => match &hall {
+                Some((link, _)) => match link.set_config_id(id) {
+                    Ok(after) => {
+                        let _ = tx.send(Event::HeConfigId(after));
+                        // The new profile may carry a different lighting page.
+                        refresh_he(link, &tx);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Event::Error(format!("{e}")));
+                    }
+                },
+                None => send_disconnected(&tx),
+            },
+            Request::HeFillKeys(rgb) => match &hall {
+                Some((link, _)) => {
+                    let result = link.keymap().and_then(|keys| {
+                        let entries: Vec<(u8, [u8; 3])> =
+                            keys.iter().map(|k| (k.value, rgb)).collect();
+                        link.set_key_colors(&entries).map(|()| entries.len())
+                    });
+                    match result {
+                        Ok(n) => {
+                            let _ = tx.send(Event::Log(format!(
+                                "filled {n} key colours with #{:02x}{:02x}{:02x}",
+                                rgb[0], rgb[1], rgb[2]
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Event::Error(format!("{e}")));
+                        }
+                    }
+                }
                 None => send_disconnected(&tx),
             },
             Request::WriteConfig(page) => with(&kb, &tx, |k| {
@@ -154,25 +227,57 @@ fn run(profiles: Vec<DeviceProfile>, rx: Receiver<Request>, tx: Sender<Event>) {
     }
 }
 
-fn connect(profiles: &[DeviceProfile], tx: &Sender<Event>) -> Option<Keyboard> {
+fn connect_mechanical(profiles: &[DeviceProfile], tx: &Sender<Event>) -> Option<Keyboard> {
     let (found, problems) = device::autodetect(profiles);
     for p in problems {
         let _ = tx.send(Event::Log(p));
     }
-    match found {
-        Some(kb) => {
-            let _ = tx.send(Event::Connected {
-                profile_id: kb.profile.id.clone(),
-                display_name: kb.profile.name.clone(),
-                password: kb.password,
-                report_id: kb.link.report_id(),
-                node: kb.link.node_path(),
-            });
-            Some(kb)
+    let kb = found?;
+    let _ = tx.send(Event::Connected {
+        profile_id: kb.profile.id.clone(),
+        display_name: kb.profile.name.clone(),
+        password: kb.password,
+        report_id: kb.link.report_id(),
+        node: kb.link.node_path(),
+    });
+    Some(kb)
+}
+
+/// Open the Hall-effect keyboard and read its identity. Sends `SYNC` and the
+/// query frames, which do not change a setting.
+fn connect_he(tx: &Sender<Event>) -> Option<(he::Link, he::Info)> {
+    let node = he::find()?;
+    let link = match he::Link::open(&node) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = tx.send(Event::Log(format!("{}: {e}", node.dev_path.display())));
+            return None;
         }
-        None => {
-            send_disconnected(tx);
-            None
+    };
+    let info = match link.info() {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = tx.send(Event::Error(format!(
+                "reading the Hall-effect keyboard failed: {e}"
+            )));
+            return None;
+        }
+    };
+    let _ = tx.send(Event::HeConnected {
+        info: info.clone(),
+        node: node.dev_path.display().to_string(),
+        config_id: link.config_id().unwrap_or(0),
+    });
+    Some((link, info))
+}
+
+fn refresh_he(link: &he::Link, tx: &Sender<Event>) {
+    match link.lighting() {
+        Ok(l) => {
+            let _ = tx.send(Event::HeLighting(l));
+        }
+        Err(e) => {
+            let _ = tx.send(Event::Log(format!("lighting unavailable: {e}")));
         }
     }
 }

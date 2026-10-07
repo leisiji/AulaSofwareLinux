@@ -154,6 +154,7 @@ mod tests {
             pid: 0x010c,
             name: "BY Tech Gaming Keyboard".into(),
             feature_reports: features,
+            collections: vec![],
         }
     }
 

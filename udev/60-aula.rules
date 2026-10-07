@@ -16,3 +16,5 @@
 KERNEL=="hidraw*", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess", MODE="0660"
 # 2.4 GHz dongle used by the tri-mode models.
 KERNEL=="hidraw*", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess", MODE="0660"
+# Hall-effect generation (WIN 60/68 HE), vendor usage page 0xFFA0.
+KERNEL=="hidraw*", ATTRS{idVendor}=="1ca2", ATTRS{idProduct}=="1902", TAG+="uaccess", MODE="0660"

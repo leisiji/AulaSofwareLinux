@@ -100,7 +100,9 @@ firmware generation, command channel and command set.
 
 **Not covered:** AULA products built on different silicon — the S98Pro (SONiX
 `0c45:800a`), the older Delphi-era tools (F108, F98Pro, S75Pro, SC620, F2088)
-and the mice. Those need their own protocol backends.
+and the mice. Those need their own protocol backends. The Hall-effect family
+(WIN 60/68 HE) does have one now, for identification — see
+[below](#aula-hall-effect-keyboards-win-6068-he).
 
 <details>
 <summary><b>Adding a model</b></summary>
@@ -130,6 +132,64 @@ it read, so you can see immediately what needs adding.
 
 ---
 
+## AULA Hall-effect keyboards (WIN 60/68 HE)
+
+The Hall-effect generation — `WIN 60 HE`, `WIN 68 HE`, and their PRO/MAX/ULTRA
+variants — is a different family on different silicon (USB `1ca2:1902`, vendor
+usage page `0xFFA0`). It does not speak the BYCOMBO4 protocol, so it is handled
+by its own backend (`src/he.rs`).
+
+Supported today are **identification**, **lighting**, **per-key colours** and
+**profile switching**:
+
+```bash
+~/.local/share/aula/aula he-info      # model, firmware, travel limits
+~/.local/share/aula/aula he-light     # read the lighting page
+~/.local/share/aula/aula he-light on
+~/.local/share/aula/aula he-light mode 1
+~/.local/share/aula/aula he-light brightness 4
+~/.local/share/aula/aula he-light color 00a0ff
+~/.local/share/aula/aula he-profile   # active onboard profile
+~/.local/share/aula/aula he-profile 1 # switch to profile 2
+~/.local/share/aula/aula he-keys      # the base key matrix
+~/.local/share/aula/aula he-rgb       # per-key custom colours
+~/.local/share/aula/aula he-rgb fill 00a0ff
+```
+
+The window recognises it too. With no mechanical keyboard attached, opening
+`aula` falls back to the Hall-effect backend and shows the device details, a
+profile selector (four onboard configurations), a lighting page and a
+"fill all key colours" control, instead of "Please connect your device.".
+
+Reading the key matrix (`he-keys`) is implemented. Writing a remap is not yet:
+the firmware's layout table stores per-key overrides for four Fn layers and a
+dozen per-key settings, and the write encoding has not been confirmed on
+hardware, so `aula` does not touch it.
+
+```
+model      WIN 60 HE PRO
+firmware   App V1.1.6
+protocol   1.0.9
+travel     0.020 mm min, 3.400 mm max, precision 0.020 mm
+```
+
+`he-info` sends only the handshake and query frames (`SYNC`, model name,
+protocol version, travel limits, polling rate) — nothing that changes a
+setting. It finds the keyboard by the shape of its HID report descriptor
+(`0xFFA0`/`0x01`, 64-byte input and output reports), so the USB id does not have
+to be trusted.
+
+`he-light` reads the lighting page and, given a setting, reads the page first,
+patches only that field, writes it back, then reads it back and compares. If
+the write does not stick the previous page is restored and the command fails.
+
+Per-key RGB, actuation and rapid trigger are decoded from AULA's own web driver
+but not implemented yet. In the meantime AULA's web driver at
+<https://win.aulacn.com> works on Linux in Chromium — the udev rule from
+`aula udev` covers `1ca2:1902` too.
+
+---
+
 ## Command line
 
 The window is the point, but everything is reachable from a terminal too — the
@@ -139,6 +199,11 @@ protocol console is how the remaining unknown bytes get pinned down.
 aula                       open the window
 aula devices               list hidraw nodes and the profiles that match
 aula info                  identify the attached keyboard
+aula he-info               identify an AULA Hall-effect keyboard (WIN 60/68 HE)
+aula he-light [setting v]  read or change the Hall-effect keyboard's lighting
+aula he-profile [0-3]      show or switch the active onboard profile
+aula he-keys               dump the Hall-effect key matrix
+aula he-rgb [fill RRGGBB]  read or fill the per-key colours
 aula dump [len]            read the settings page and print it
 aula read <cmd> <param> <len>
                            raw read from the command channel
@@ -201,6 +266,7 @@ The full protocol is documented in the doc comments of
 src/ini.rs           vendor INI reader (UTF-16 / UTF-8 / GBK)
 src/profile.rs       KB.ini -> device description
 src/hid.rs           hidraw transport and report-descriptor parsing
+src/he.rs            the Hall-effect family (WIN 60/68 HE), identification
 src/proto.rs         the vendor frame format and command set
 src/device.rs        discovery and model identification
 src/config_page.rs   the settings page, read-modify-write
